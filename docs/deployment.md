@@ -27,8 +27,8 @@
 - [x] 1. VPS 基本設定（見 `vps-setup.md`）
 - [x] 2. 安裝 Node.js / pnpm / Docker / PM2 / Nginx / git
 - [x] 3. 把 code 拉到 VPS、安裝依賴（HTTPS clone, public repo, pull-only）
-- [ ] 4. 設定環境變數（`.env`）
-- [ ] 5. 用 Docker 啟動 Postgres、跑 migration
+- [x] 4. 設定環境變數（`.env`）
+- [x] 5. 用 Docker 啟動 Postgres、跑 migration
 - [ ] 6. Build api（tsc/輸出 dist）與 web（vite build → `dist/` 靜態檔）
 - [ ] 7. 用 PM2 啟動 api
 - [ ] 8. 設定 Nginx：靜態服務 web、reverse proxy `/api` 到 api
@@ -89,4 +89,79 @@ pnpm install
 
 Public repo + 只在本機 push、VPS 只 pull → 直接 HTTPS clone，不設 SSH key
 
-### 4. 設定環境變數（下一步）
+### 4. 設定環境變數 ✅
+
+#### 權限：`chmod 600 .env`
+
+`.env` 是明文密碼，改成只有 owner 能讀寫。
+
+驗證：
+
+```bash
+ls -la .env
+# -rw------- 1 <username> <username> ...
+```
+
+#### 把所有對外服務改成只 bind loopback
+
+兩個改動：
+
+1. **`apps/api/src/index.ts`** — `app.listen(port, '127.0.0.1', ...)`
+   - 不寫 host 時 Node 預設綁 `0.0.0.0`（所有介面），公網都看得到。
+   - 改成 `127.0.0.1` 後只接 loopback，Nginx 從本機 reverse proxy 進來。
+
+2. **`docker-compose.yml`** — `"127.0.0.1:${POSTGRES_PORT}:5432"`
+   - **重要**：Docker 直接動 iptables，把規則插在 ufw 前面，
+     ufw `deny 5432` 對 container **無效**，會把 Postgres 直接曝光到公網。
+   - bind 到 `127.0.0.1` 是最簡單、不需要改 `DOCKER-USER` chain 的解法。
+
+### 5. Docker 啟動 Postgres + 跑 migration ✅
+
+#### 啟動 Postgres
+
+```bash
+cd ~/playground
+docker compose up -d   # -d = detached（背景跑）
+docker compose ps      # 確認 running
+```
+
+#### 跑 migration
+
+repo 沒有 migration runner（`apps/api/migrations/0001_init.sql` 是 raw SQL，
+`package.json` 也沒對應 script）。手動灌進 Postgres：
+
+```bash
+# 把 .env 載到 host shell（這樣 $POSTGRES_USER 等變數可用）
+set -a; source .env; set +a
+
+# 餵 SQL 進 container 的 psql
+docker compose exec -T postgres \
+  psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  < apps/api/migrations/0001_init.sql
+```
+
+關鍵語法：
+
+- **`-T`**：不分配 TTY。預設 `docker compose exec` 會給 TTY，TTY 會把 stdin 接管，
+  導致 shell `<` 重導送不進去。手動互動進 psql 時不要加；餵檔案/pipe/script 一定要加。
+- **`-U "$POSTGRES_USER" -d "$POSTGRES_DB"`**：明確指定 user 和 db。不寫的話 psql
+  會 fallback 到 OS 登入帳號（container 裡是 `root`），找不到對應 PG user 直接報錯。
+  變數展開是在 **host shell** 做的，所以前面要先 `source .env`。
+
+#### 驗證 schema
+
+```bash
+docker compose exec postgres \
+  psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "\dt"
+```
+
+應該看到三個 table：`users` / `posts` / `comments`。
+
+psql meta-command 速查：`\dt` 列 table、`\d users` 看 schema、`\l` 列 db、`\q` 退出。
+
+#### 注意：volume 持久化
+
+資料存在 named volume `pgdata` 裡，`docker compose down` 之後重新 `up` 不會重跑
+migration（schema 還在）。除非用 `docker compose down -v`（`-v` 砍 volume）。
+
+### 6. Build api 與 web（下一步）
