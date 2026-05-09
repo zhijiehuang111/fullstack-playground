@@ -29,8 +29,8 @@
 - [x] 3. 把 code 拉到 VPS、安裝依賴（HTTPS clone, public repo, pull-only）
 - [x] 4. 設定環境變數（`.env`）
 - [x] 5. 用 Docker 啟動 Postgres、跑 migration
-- [ ] 6. Build api（tsc/輸出 dist）與 web（vite build → `dist/` 靜態檔）
-- [ ] 7. 用 PM2 啟動 api
+- [x] 6. Build api（tsc/輸出 dist）與 web（vite build → `dist/` 靜態檔）
+- [ ] 7. 用 PM2 啟動 api（記得處理 production 的 env 載入）
 - [ ] 8. 設定 Nginx：靜態服務 web、reverse proxy `/api` 到 api
 - [ ] 9. Cloudflare DNS 指向 VPS
 - [ ] 10. 開啟 HTTPS（Cloudflare proxy + Origin cert，或 Let's Encrypt）
@@ -164,4 +164,51 @@ psql meta-command 速查：`\dt` 列 table、`\d users` 看 schema、`\l` 列 db
 資料存在 named volume `pgdata` 裡，`docker compose down` 之後重新 `up` 不會重跑
 migration（schema 還在）。除非用 `docker compose down -v`（`-v` 砍 volume）。
 
-### 6. Build api 與 web（下一步）
+### 6. Build api 與 web ✅
+
+```bash
+cd ~/playground
+pnpm build      # root 的 "build": "pnpm -r build"，遞迴跑每個 workspace 的 build
+```
+
+兩個 workspace 的 build 角色不同：
+
+#### `apps/api`：`tsc -p tsconfig.json`
+
+純 TypeScript compiler，**翻譯**：`src/*.ts` → `dist/*.js`，一對一輸出。
+不 bundle、不 minify、不改 import 路徑——`import express from 'express'` 在輸出裡原樣保留，
+runtime 由 Node 自己去 `node_modules` 解析。**部署時 `node_modules` 必須在 VPS 上**。
+
+#### `apps/web`：`tsc -b && vite build`
+
+兩步，順序有意義：
+
+- **`tsc -b`**：build mode，按 `tsconfig.json` 的 `references`（`tsconfig.app.json` + `tsconfig.node.json`）
+  順序跑型別檢查。兩份 sub-config 是因為 `src/**` 跑在瀏覽器（要 `DOM` lib + `vite/client` types），
+  `vite.config.ts` 跑在 Node（要 `node` types），型別環境必須隔離。兩份都設 `noEmit: true`，
+  所以這步**只 type check 不產出 .js**——擋型別錯，錯了就終止。
+- **`vite build`**：真正的 bundler（esbuild + Rollup）。把 `.ts/.tsx/.css/依賴` 全部攤平成
+  少量 hash 過的 chunks，**包含 `node_modules` 都 bundle 進去**。輸出 `dist/index.html` + `dist/assets/*`，
+  純靜態檔，runtime 不需要 `node_modules`。
+
+對照表：
+
+|  | `apps/api` | `apps/web` |
+|---|---|---|
+| 跑在哪 | Node.js（VPS） | 瀏覽器 |
+| 編譯器 | tsc（emit） | esbuild/Rollup（vite）；tsc 只 type-check |
+| 是否 bundle | ❌ 多檔對多檔 | ✅ 攤平成少量 chunks |
+| 部署需 `node_modules` | ✅ 要 | ❌ 不用 |
+| 部署方式 | PM2 跑 `node dist/index.js` | nginx serve `dist/` |
+
+#### 驗證
+
+```bash
+ls apps/api/dist/index.js          # 存在
+ls apps/web/dist/index.html        # 存在，旁邊應該有 assets/
+```
+
+### 7. PM2 啟動 api（下一步）
+
+待處理：`apps/api/package.json` 的 `start` 是 `node dist/index.js`，**沒有 `--env-file`**，
+production 不會自動載 `.env`。下一步用 PM2 ecosystem config 或 `--node-args="--env-file=..."` 帶進去。
