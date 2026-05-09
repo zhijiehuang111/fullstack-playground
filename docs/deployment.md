@@ -9,17 +9,17 @@
                    │
                    ▼
               VPS (Ubuntu)
-        ┌──────────────────────┐
-        │  Nginx                │
-        │   ├─ /       → 靜態   │ ← web (Vite build)
-        │   └─ /api/*  → :PORT  │ ← reverse proxy 到 api
-        │                       │
-        │  PM2                  │
-        │   └─ api (node)       │
-        │                       │
-        │  Docker               │
-        │   └─ postgres:16      │
-        └──────────────────────┘
+        ┌─────────────────────────┐
+        │  Nginx                  │
+        │   ├─ /       → 靜態     │ ← web (Vite build)
+        │   └─ /api/*  → :PORT    │ ← reverse proxy 到 api
+        │                         │
+        │  PM2                    │
+        │   └─ api (node)         │
+        │                         │
+        │  Docker                 │
+        │   └─ postgres:16        │
+        └─────────────────────────┘
 ```
 
 ## 步驟總覽
@@ -31,7 +31,7 @@
 - [x] 5. 用 Docker 啟動 Postgres、跑 migration
 - [x] 6. Build api（tsc/輸出 dist）與 web（vite build → `dist/` 靜態檔）
 - [x] 7. 用 PM2 啟動 api
-- [ ] 8. 設定 Nginx：靜態服務 web、reverse proxy `/api` 到 api
+- [x] 8. 設定 Nginx：靜態服務 web、reverse proxy `/api` 到 api
 - [ ] 9. Cloudflare DNS 指向 VPS
 - [ ] 10. 開啟 HTTPS（Cloudflare proxy + Origin cert，或 Let's Encrypt）
 - [ ] 11. PM2 開機自啟
@@ -309,3 +309,154 @@ restart_delay: 2000,
 | **VPS reboot** | **api 不會自己回來 ❌**                       |
 
 VPS reboot 後自動回來要做第 11 步（`pm2 startup` + `pm2 save`），現在先放著。
+
+### 8. 設定 Nginx ✅
+
+#### 架構
+
+```
+瀏覽器 → Nginx (80) ─┬─ /        → 靜態檔 (apps/web/dist/)
+                     └─ /api/*   → reverse proxy → 127.0.0.1:3000 (PM2 api)
+```
+
+#### `sites-available` / `sites-enabled` 慣例
+
+Debian/Ubuntu 把 Nginx config 拆成兩層資料夾：
+
+- `/etc/nginx/sites-available/` — **所有寫過的 config**（草稿夾）
+- `/etc/nginx/sites-enabled/` — **目前啟用中**（`/etc/nginx/nginx.conf` 裡 `include sites-enabled/*;`，Nginx 只讀這個）
+
+啟用 = 建 symlink（`ln -s` 把 sites-available 的檔案捷徑放進 sites-enabled）。停用 = `rm` 那個 symlink，原檔還在 sites-available 留著想恢復就再 `ln -s`。
+
+為啥不直接寫在 sites-enabled、或複製兩份：
+
+- 編輯只在一個地方（sites-available），不會兩份漂移
+- 啟用/停用就是 symlink 增減，原檔不動
+- `git`-able：可以把 sites-available 的 config 抄一份進 repo 版控
+
+⚠️ 有些發行版（CentOS、Alpine）沒這兩層，只有 `/etc/nginx/conf.d/*.conf`。Debian/Ubuntu 是約定俗成多了一層 staging。
+
+#### 砍 default site
+
+```bash
+sudo rm /etc/nginx/sites-enabled/default
+sudo systemctl reload nginx     # 砍完一定要 reload，不然進程裡的 config 還是舊的
+```
+
+#### 寫 site config
+
+`/etc/nginx/sites-available/playground`：
+
+```nginx
+server {
+    listen 80;
+    listen [::]:80;
+    server_name <vps-ip>;
+
+    root /home/<username>/playground/apps/web/dist;
+    index index.html;
+
+    # SPA fallback：找不到實體檔回 index.html，讓 React Router 接管 client routing
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # API reverse proxy
+    location /api/ {
+        proxy_pass http://127.0.0.1:3000/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Vite 產出的 asset 檔名有 hash，可以放心長 cache
+    location /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+}
+```
+
+`server_name <vps-ip>` 是現在用 IP 直接打的 placeholder；之後上 domain 改成 `server_name your-domain.com;`。（題外話：因為 sites-enabled 砍掉 default 後只剩這一個 server block，自動變 default，所以 `server_name` 寫什麼瀏覽器都進得來——`server_name _;` + `listen 80 default_server;` 是更「沒 domain」的標準寫法，但意思一樣。）
+
+#### `location` 匹配 + `proxy_pass` 結尾斜線（重要觀念）
+
+**`location /api/`** 是 URL path 的**前綴匹配**——請求 path 以 `/api/` 開頭才進這個 block（跟 Express `app.use("/api", ...)` 同概念）。一個 server 裡多個 `location`，Nginx 挑最具體的跑：`/api/users` 進來時 `location /` 跟 `location /api/` 都能匹配，但後者更具體 → 走後者。
+
+**`proxy_pass`** 是「不要自己處理，當中間人轉給後面這台」。結尾有沒有 `/` 是兩條完全不同的規則：
+
+| `proxy_pass` 結尾 | 行為                                               | 何時用                   |
+| ----------------- | -------------------------------------------------- | ------------------------ |
+| 有 `/`            | **剝掉 `location` 前綴，剩下接在 proxy_pass 後面** | 後端**沒**帶 `/api` 前綴 |
+| 沒 `/`            | **整段 URI 原樣轉發**                              | 後端**有**帶 `/api` 前綴 |
+
+本 repo 前端 `fetch('/api/users')`、後端 `app.use("/users", ...)`（`apps/api/src/app.ts:11`）**沒**帶前綴，所以用「有 `/`」：
+
+| 瀏覽器               | 剝完 `/api/` 剩下 | 接到 `http://127.0.0.1:3000/` 後      | api 收到            |
+| -------------------- | ----------------- | ------------------------------------- | ------------------- |
+| `/api/users`         | `users`           | `http://127.0.0.1:3000/users`         | `/users` ✅         |
+| `/api/posts/1`       | `posts/1`         | `http://127.0.0.1:3000/posts/1`       | `/posts/1` ✅       |
+| `/api/users?limit=5` | `users?limit=5`   | `http://127.0.0.1:3000/users?limit=5` | `/users?limit=5` ✅ |
+
+「結尾 `/` 一定要保留」的真正原因是字串接：少了 `/` 會接成 `http://127.0.0.1:3000users`，整個 URL 壞掉。
+
+反面教材（記反就 404）：
+
+```nginx
+# ❌ 後端是 /users，但用了「原樣送」
+location /api/ { proxy_pass http://127.0.0.1:3000; }   # → api 收到 /api/users → 404
+
+# ❌ 後端是 /api/users，但用了「剝前綴」
+location /api/ { proxy_pass http://127.0.0.1:3000/; }  # → api 收到 /users → 404
+```
+
+選哪條 = 看後端路由有沒有帶 `/api`，兩邊要對得上。
+
+`/api` 前綴是給 Nginx 看的「路標」（讓它能 prefix 區分「這要轉給 api」vs「這是要靜態檔」），不是 api 自己的路徑。前端寫 `fetch('/api/...')` 是相對 URL，自動接到當前 origin → 跟 web 同 origin → 沒 CORS 問題。
+
+#### 啟用 + 測試 + reload（每次改 config 的標準三步）
+
+```bash
+sudo ln -s /etc/nginx/sites-available/playground /etc/nginx/sites-enabled/
+sudo nginx -t                  # 只測 syntax 不套用，先測過再 reload，避免改壞整站掛
+sudo systemctl reload nginx    # graceful：起新 worker 套新 config，舊的處理完手上請求才退，不中斷連線
+```
+
+#### 給 nginx 讀靜態檔的權限
+
+Nginx worker 跑在 `www-data`（master 是 root，但 worker 降權；`ps aux | grep nginx` 看得到），不是你的 user。`/home/<username>` 預設 `750`，others 完全進不去 → worker 連 stat 都 fail。
+
+```bash
+chmod o+x /home/<username>     # 只開 execute（能 traverse 進來），不開 read（不能 ls home 內容）
+```
+
+dist 裡的檔案因為 `umask 002` 預設就是 `775/664`（others 已有 r/x），不用再動。驗證：
+
+```bash
+sudo -u www-data cat /home/<username>/playground/apps/web/dist/index.html
+```
+
+讀得到就 OK。
+
+#### 驗證
+
+從本機（不是 VPS）：
+
+```bash
+curl -I http://<vps-ip>/              # 200, content-type text/html
+curl http://<vps-ip>/api/users        # api 的 JSON response
+```
+
+瀏覽器打 `http://<vps-ip>/` 應該看到 web app；切到任意 SPA route 重整也要回得來（驗 SPA fallback）。
+
+#### 踩過的雷
+
+**砍 default 後還看得到 Welcome page** — `rm` symlink 只動檔案，nginx 進程裡的 config 還是舊的。`sudo systemctl reload nginx`。瀏覽器快取也可能誤導，用無痕或 `curl -I` 確認。
+
+**第一次 curl 拿到 500 不是 403** — 兩個都跟權限有關但卡點不同：
+
+> 一句話：500 是 Nginx 連 stat 都 fail（home 目錄沒 `o+x`，traverse 不進去 → 內部處理鏈炸掉），403 是進得去但檔案沒 `r`。補完 `chmod o+x /home/<username>` 就消失。
+
+排查永遠先看 `sudo tail /var/log/nginx/error.log`，會直接寫卡在哪個路徑。
