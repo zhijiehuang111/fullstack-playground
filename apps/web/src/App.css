@@ -11,6 +11,28 @@
   letter-spacing: -0.3px;
 }
 
+.route-nav {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 24px;
+  font-size: 14px;
+}
+
+.route-nav a {
+  color: var(--text);
+  text-decoration: none;
+  opacity: 0.6;
+}
+
+.route-nav a.active {
+  opacity: 1;
+  font-weight: 600;
+}
+
+.page {
+  line-height: 1.6;
+}
+
 .tabs {
   display: flex;
   gap: 4px;
