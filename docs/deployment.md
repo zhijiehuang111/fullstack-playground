@@ -34,8 +34,7 @@
 - [x] 8. 設定 Nginx：靜態服務 web、reverse proxy `/api` 到 api
 - [x] 9. Cloudflare DNS 指向 VPS（灰雲 / DNS only）
 - [x] 10. 開啟 HTTPS（Let's Encrypt）
-- [ ] 11. PM2 開機自啟
-- [ ] 12. 收尾：log、備份、防火牆覆查
+- [x] 11. PM2 開機自啟 + Docker container 自啟
 
 ---
 
@@ -515,3 +514,115 @@ sudo certbot renew --dry-run        # 模擬續期
 #### 自動 renew
 
 Let's Encrypt cert 只活 90 天；snap 版 certbot 自動裝 systemd timer 每天跑兩次 `certbot renew`，到期前 30 天自動續、續完自動 reload Nginx，**裝完不用管**。
+
+### 11. 開機自啟（PM2 + Docker） ✅
+
+目標：VPS reboot 後不用 ssh 上來手動啟動，整個 stack 自己回來。三段：postgres container、PM2 daemon、api process。
+
+#### Docker container：`restart: unless-stopped`
+
+`docker compose up -d` 只是「現在跑起來」，container 預設沒 restart policy → reboot 後 Docker daemon 雖然會自啟，但 container 不會跟著起。
+
+編 `docker-compose.yml`，給 postgres service 加：
+
+```yaml
+services:
+  postgres:
+    # ...
+    restart: unless-stopped
+```
+
+#### PM2 daemon：systemd service
+
+PM2 是 user-space daemon，自己**不會**在開機被叫起來，要靠 systemd 拉。`pm2 startup` 不直接安裝，而是**印一段 `sudo env ...` 指令**叫你貼——因為要寫 `/etc/systemd/system/` 需要 root，PM2 不自己 sudo。
+
+```bash
+pm2 startup
+# 印出：sudo env PATH=$PATH:... pm2 startup systemd -u <username> --hp /home/<username>
+# 把那段整段複製貼上跑一次 → 寫 unit + enable
+```
+
+#### `pm2 save`：把 process list 存進 dump
+
+systemd 會拉 daemon，但 daemon 起來時是空的——它不知道你有哪些 app。`pm2 save` 把當前 `pm2 ls` dump 成 `~/.pm2/dump.pm2`，daemon 開機讀這檔還原。
+
+```bash
+pm2 save
+```
+
+⚠️ 之後**每次改 process list（add/delete app）都要重 save 一次**，否則下次 reboot 會還原成舊狀態。
+
+#### 大雷：fnm + PM2 = `spawn node ENOENT`
+
+第一次 reboot 後撞到的：`pm2 ls` 顯示 `online` 但 `memory: 0b`、`ss -tlnp | grep 3000` 沒輸出、`pm2 logs api --err` 空的、手動 `pm2 restart api` 也救不回來。
+
+死因藏在 `~/.pm2/pm2.log`：
+
+```
+PM2 error: Error: spawn node ENOENT
+    at ChildProcess._handle.onexit (node:internal/child_process:287:19)
+```
+
+（`pm2 ls` 的 `pidusage` error 是症狀不是病因——daemon 拿著不存在的 PID 去查 stats 才噴的。）
+
+##### 為什麼 fnm 會雷
+
+fnm 用 **per-shell multishell**：每個 shell 開一個臨時目錄（`/tmp/fnm_multishells/<shell-pid>_<timestamp>/bin/node`），把這個路徑塞進 PATH。PM2 daemon 在你跑 `pm2 start` 時抄走當下 shell 的 PATH，之後就 detached 自己跑。
+
+reboot 之後兩件事一起發生：
+
+1. **`/tmp` 被 systemd-tmpfiles 清空**：所有 multishell 目錄物理消失
+2. **systemd 啟動 daemon 時不跑 `~/.bashrc`**：連 fnm hook 都沒 load
+
+systemd unit 裡寫的 PATH 指向已經不存在的目錄 → daemon resurrect 後第一次 spawn `node` → ENOENT → api 永遠起不來。即使你 ssh 進來手動 `pm2 restart api`，那個 IPC 是丟給 daemon 的，daemon 還是用自己內部那條壞掉的 PATH 去 spawn，一樣救不回來。
+
+##### 修法：`ecosystem.config.cjs` 寫死 `interpreter`
+
+把 PM2 spawn child 用的 node 從「靠 PATH 找」改成「絕對路徑」，跟 version manager 完全脫鉤：
+
+```js
+// ecosystem.config.cjs
+module.exports = {
+  apps: [
+    {
+      name: "api",
+      cwd: __dirname,
+      script: "./apps/api/dist/index.js",
+      interpreter: process.execPath, // ← 關鍵：用當前 PM2 的 node 絕對路徑
+      node_args: "--env-file=.env",
+      exec_mode: "fork",
+      instances: 1,
+      autorestart: true,
+      max_memory_restart: "300M",
+    },
+  ],
+};
+```
+
+`process.execPath` 是執行當前這個 node process 的 binary 絕對路徑（PM2 載 config 時自己就是 node process）。VPS 上會自動填成類似 `/home/<username>/.local/share/fnm/node-versions/v24.x.x/installation/bin/node`。
+
+也可以寫死字串路徑，但 `process.execPath` 跨機 portable、Node 升版自動跟著走，commit 進 repo 後沒副作用（Mac dev 不跑 PM2）。
+
+##### 套用 + 全清重來
+
+舊 daemon 抄了壞 PATH 進去，state 已被污染，光 `pm2 restart` 沒用。要連 daemon 帶 dump 一起砍：
+
+```bash
+pm2 kill                              # 殺整個 PM2 daemon
+rm -f ~/.pm2/dump.pm2 ~/.pm2/pm2.log  # 清舊 dump 跟 log
+cd ~/playground
+pm2 start ecosystem.config.cjs
+pm2 ls                                # memory 應該有數字（不是 0b）
+ss -tlnp | grep 3000                  # LISTEN 127.0.0.1:3000
+pm2 save                              # 把乾淨狀態寫進 dump
+```
+
+#### 真實演練：reboot 驗收
+
+```bash
+sudo reboot
+# 等 30 秒 ssh 回來
+docker compose ps              # postgres Up（自啟）
+pm2 ls                         # api online，memory 有數字
+ss -tlnp | grep 3000           # LISTEN
+```
