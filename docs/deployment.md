@@ -32,8 +32,8 @@
 - [x] 6. Build api（tsc/輸出 dist）與 web（vite build → `dist/` 靜態檔）
 - [x] 7. 用 PM2 啟動 api
 - [x] 8. 設定 Nginx：靜態服務 web、reverse proxy `/api` 到 api
-- [ ] 9. Cloudflare DNS 指向 VPS
-- [ ] 10. 開啟 HTTPS（Cloudflare proxy + Origin cert，或 Let's Encrypt）
+- [x] 9. Cloudflare DNS 指向 VPS（灰雲 / DNS only）
+- [x] 10. 開啟 HTTPS（Let's Encrypt）
 - [ ] 11. PM2 開機自啟
 - [ ] 12. 收尾：log、備份、防火牆覆查
 
@@ -460,3 +460,58 @@ curl http://<vps-ip>/api/users        # api 的 JSON response
 > 一句話：500 是 Nginx 連 stat 都 fail（home 目錄沒 `o+x`，traverse 不進去 → 內部處理鏈炸掉），403 是進得去但檔案沒 `r`。補完 `chmod o+x /home/<username>` 就消失。
 
 排查永遠先看 `sudo tail /var/log/nginx/error.log`，會直接寫卡在哪個路徑。
+
+### 9. Cloudflare DNS ✅
+
+Domain 在 Cloudflare 買的，nameserver 預設就指向 Cloudflare，只要在 DNS 頁加一筆 A record：
+
+- Type: `A`
+- Name: `@`（root domain）
+- IPv4: `<vps-ip>`
+- Proxy status: **DNS only（灰雲）**
+
+選灰雲的理由：第 10 步要用 Let's Encrypt 練 certbot 流程，灰雲下瀏覽器直連 VPS，cert 在 VPS 上發、在 VPS 上驗證（http-01 challenge 走 80 port），整個鏈路最直觀。橘雲 + Cloudflare Origin Cert 比較簡單但比較「黑盒」，等之後想加 CDN/DDoS 保護再切。
+
+代價：VPS 真實 IP 會直接從 `dig your-domain.com` 查得到（A record 就是寫這個 IP）。但 ufw + fail2ban + 關 root SSH 已經做了，個人專案可接受。
+
+### 10. HTTPS / Let's Encrypt ✅
+
+#### 概念
+
+HTTPS = HTTP 包在 TLS（舊名 SSL）裡傳；cert 是 CA 簽發的「身分證」，證明這把 public key 屬於這個 domain；現代 TLS 1.3 用 ECDHE 算 session key（forward secrecy），cert 只負責簽名驗身分、不直接搬 session key。
+
+#### 安裝 certbot（snap）
+
+EFF 官方主推 snap 版（永遠最新、自帶 Python 不會被系統升級爆掉）；apt 版也能跑但較舊。
+
+```bash
+sudo snap install --classic certbot
+sudo ln -s /snap/bin/certbot /usr/bin/certbot   # 讓 sudo 找得到
+sudo certbot --version
+```
+
+`--classic` = 關 sandbox，因為 certbot 要寫 `/etc/letsencrypt/`、改 `/etc/nginx/`。
+
+#### 前置檢查
+
+跑 certbot 前要確認：Nginx config `server_name` 從 `<vps-ip>` 改成 domain（Let's Encrypt 不發 cert 給 IP）、ufw 開 80（http-01 challenge 走 80）、`dig your-domain.com +short` 解析正確、`curl -I http://your-domain.com/` 拿到 200。
+
+#### 跑 certbot（互動式）
+
+```bash
+sudo certbot --nginx
+```
+
+certbot 會掃所有 `server_name`、列清單問選哪個、自動跑 http-01 challenge、cert 存到 `/etc/letsencrypt/live/<domain>/`、改 Nginx config 加 `listen 443 ssl` + `ssl_certificate` + 80→443 redirect、`nginx -t` + reload。第一次跑會問 email（cert 過期通知）、同意 ToS、EFF newsletter（選 N）。
+
+#### 驗證
+
+```bash
+curl -I https://your-domain.com/    # 200
+curl -I http://your-domain.com/     # 301 → https
+sudo certbot renew --dry-run        # 模擬續期
+```
+
+#### 自動 renew
+
+Let's Encrypt cert 只活 90 天；snap 版 certbot 自動裝 systemd timer 每天跑兩次 `certbot renew`，到期前 30 天自動續、續完自動 reload Nginx，**裝完不用管**。
